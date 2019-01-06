@@ -1,0 +1,223 @@
+#!/bin/bash
+
+BACKUP_NAME="备份"
+RESTORE_NAME="恢复"
+WINDOW_WIDTH=480
+WINDOW_HEIGHT=320
+
+SYSTEM_MNT=/mnt/sys
+BACKUP_MNT=/mnt/bak
+BACKUP_DIR=$BACKUP_MNT/backup
+RESTORE_DIR=$SYSTEM_MNT
+BACKUP_TARGET=$SYSTEM_MNT
+
+BACKUP_FILE_NAME=""
+RESTORE_FILE_NAME=""
+CMD_BACKUP=""
+CMD_RESTORE=""
+SELECTION=""
+#SYS_DISK=`mount | grep /run/initramfs/isoscan | awk -F ' ' '{print $1}' | sed 's/[0-9].*$//'`
+SYS_DISK=""
+
+get_sys_disk() {
+
+        DISK_3=`fdisk  -l | grep "^/dev/sd.3" |awk '{print $1}'`
+
+        rm -rf /tmp/disk3
+        mkdir /tmp/disk3
+
+        DISK_PART=""
+
+        for disk in $DISK_3
+        do
+
+                mount $disk  /tmp/disk3
+                if [ -e /tmp/disk3/.boot.iso ];then
+                        DISK_PART=${disk%3}
+                        umount /tmp/disk3
+                        break
+                fi
+
+                umount /tmp/disk3
+        done
+
+        if [ $DISK_PART != "" ];then
+                SYS_DISK=$DISK_PART
+        else
+                SYS_DISK=/dev/sda
+        fi
+}
+
+
+main_window() {
+	str=$(zenity --list --radiolist --title="备份恢复工具" \
+		--text=""  --column "选择" --column "功能" \
+		True $BACKUP_NAME  Fasle $RESTORE_NAME \
+		--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT)
+	ret=$?
+	SELECTION=$str
+	echo $SELECTION
+	return $ret
+}
+
+backup_window() {
+	BACKUP_FILE_NAME=backup_$(date +%Y%m%d%H%M%S).fsa
+	str=$(zenity --entry \
+		--title="备份" \
+		--text="备份命名:" \
+		--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT \
+		--entry-text $BACKUP_FILE_NAME)
+	ret=$?
+	system_partition_mount
+	need=$(echo `df --output=used $SYSTEM_MNT` | cut -f2 --delimiter=' ')
+	system_partition_umount
+	available=$(df --output=avail $BACKUP_MNT | cut -f2 --delimiter=' ')
+	if [ $ret -eq 0 ] && [ $need -gt $available ]; then
+		destroy_backup_image_window
+	fi
+	BACKUP_FILE_NAME=$str
+	# CMD_BACKUP="fsarchiver -j4 -o savefs $BACKUP_DIR/$BACKUP_FILE_NAME /dev/sda1 /dev/sda5"
+	CMD_BACKUP="fsarchiver -j4 -o savefs $BACKUP_DIR/$BACKUP_FILE_NAME ${SYS_DISK}1"
+	return $ret
+}
+
+backup_progress_window() {	
+	(
+	echo "System backup"; $($CMD_BACKUP)
+	echo "Sync data."; sync; sync 
+	echo "# 备份完成"
+	) |
+	zenity --progress --title="备份" \
+		--text="正在备份..." --pulsate \
+		--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT
+	ret=$?
+	return $ret
+}
+
+restore_window() {
+	file_list=$(ls $BACKUP_DIR)
+	RESTORE_FILE_NAME=$(zenity --list \
+				--title="恢复" \
+				--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT \
+				--column="备份节点" \
+				$file_list)
+	ret=$?
+	if [ $ret -eq 0 ] && [ "x$RESTORE_FILE_NAME" = "x" ]; then
+		zenity --error --text="请选择一个备份文件"
+		restore_window
+	fi
+
+	# CMD_RESTORE="fsarchiver -j4 restfs $BACKUP_DIR/$RESTORE_FILE_NAME id=0,dest=/dev/sda1 id=1,dest=/dev/sda5"
+	CMD_RESTORE="fsarchiver -j4 restfs $BACKUP_DIR/$RESTORE_FILE_NAME id=0,dest=${SYS_DISK}1"
+	return $ret
+}
+
+restore_progress_window() {
+	(
+	echo "Image restore"; $($CMD_RESTORE)
+	echo "Grub2 install"; grub2_install	
+	echo "Sync data."; sync; sync 
+	echo "# 恢复完成,请重启系统！";system_partition_mount;touch $SYSTEM_MNT/.autorelabel;sync;sync;system_partition_umount
+	) |
+	zenity --progress --title="恢复" \
+		--text="正在恢复..." --pulsate \
+		--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT
+	ret=$?
+	return $ret
+}
+
+destroy_backup_image_window() {
+	lists=$(du -sh $BACKUP_DIR/* | grep -v backup_factory.fsa | awk '{ gsub("'$BACKUP_DIR'/", "", $2); print "FALSE " $2 " " $1}')
+	selected=$(zenity --list --checklist --title="删除备份"\
+			--width=$WINDOW_WIDTH --height=$WINDOW_HEIGHT \
+			--column="删除" --column="备份文件" --column="大小"\
+			$lists)
+	ret=$?
+	if [ $ret -eq 0 ]; then
+		echo $selected | awk -F '|' '{for(i=1;i<=NF;i++) {system("rm -f '$BACKUP_DIR'/"$i)}}'
+	fi
+	backup_window
+}
+
+system_partition_mount() {
+	mkdir -p $SYSTEM_MNT
+	mount ${SYS_DISK}1 $SYSTEM_MNT
+}
+
+system_partition_umount() {
+	umount $SYSTEM_MNT
+	#if [ $? -eq 0 ]; then
+	#	rm -rf $SYSTEM_MNT
+	#if
+}
+
+backup_partiontion_mount() {
+	mkdir -p $BACKUP_MNT
+	mount ${SYS_DISK}3 $BACKUP_MNT
+}
+
+umount_all() {
+	#umount $SYSTEM_MNT
+	umount $BACKUP_MNT
+	systemctl --no-wall reboot
+}
+
+grub2_install() {
+	system_partition_mount
+	mount -o bind /dev $SYSTEM_MNT/dev
+	mount -o bind /proc $SYSTEM_MNT/proc
+	chroot $SYSTEM_MNT grub2-install ${SYS_DISK}
+	umount $SYSTEM_MNT/dev
+	umount $SYSTEM_MNT/proc
+	system_partition_umount
+}
+
+run() {
+	main_window
+	if [ $? -eq 0 ]; then
+		if [ $SELECTION = $BACKUP_NAME ]; then
+			backup_window
+			if [ $? -eq 0 ]; then
+				backup_progress_window
+				if [ $? -eq 0 ]; then
+					umount_all
+					exit 0	
+				else
+					umount_all
+					exit 1
+				fi
+			else
+				umount_all
+				exit 1
+			fi
+		else
+			restore_window
+			if [ $? -eq 0 ]; then
+				restore_progress_window
+				if [ $? -eq 0 ]; then
+					umount_all
+					exit 0	
+				else
+					umount_all
+					exit 1
+				fi
+			else
+				umount_all
+				exit 1
+			fi
+		fi
+	else
+		umount_all
+		exit 1
+	fi
+}
+
+get_sys_disk
+
+backup_partiontion_mount
+
+if [ ! -e $BACKUP_DIR ]; then
+	mkdir -p $BACKUP_DIR
+fi
+
+run
